@@ -1,0 +1,1118 @@
+Building a Real-Time ELK–Suricata Lab for Web Attack Detection and Analysis
+Complete ELK Stack Monitoring Guide
+
+Introduction & Use Case Definition
+This project implements a lab-based monitoring environment that combines the ELK stack with Suricata to detect and analyze real-time cyber attacks against a deliberately vulnerable web application. An Ubuntu server hosts Elasticsearch, Logstash, Kibana, Suricata, Apache, and the OWASP-style vulnerable app, while a Kali machine generates offensive traffic such as scans, web exploits, and brute-force attempts. The work focuses on capturing these events via Suricata, enriching and shipping them through Logstash into Elasticsearch, and visualizing correlated security alerts and HTTP activity in Kibana for end-to-end threat detection and validation.
+
+1.1 Primary Objective
+
+- Ubuntu Server with IP `192.168.56.32` where ELK stack, Suricata, and a vulnerable web application (`vulnapp`) are installed.  
+- Kali attacking machine with IP `192.168.56.7`.  
+
+Real-time cyber attack detection, analysis, correlation, and validation against applications and infrastructure with near-zero latency requirements.
+
+Lab Setup: Ubuntu Server (ELK Stack) | Kali Linux (Attack Simulation)
+
+
+1. System Preparation
+
+ 1.1 Update System & Install Prerequisites
+
+```bash
+ Update system packages
+sudo apt update && sudo apt upgrade -y
+
+# Install required packages
+sudo apt install -y curl wget gnupg2 apt-transport-https software-properties-common
+
+# Install Java (required for Elasticsearch and Logstash)
+sudo apt install -y openjdk-11-jdk
+
+# Verify Java installation
+java -version
+
+ 
+2. Elasticsearch Installation & Configuration
+2.1 Install Elasticsearch
+# Import Elasticsearch GPG key
+wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+
+# Add Elasticsearch repository
+echo "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main" | sudo tee /etc/apt/sources.list.d/elastic-8.x.list
+
+# Update and install
+sudo apt update
+sudo apt install -y elasticsearch
+
+
+2.2 Configure Elasticsearch
+Create configuration file at /etc/elasticsearch/elasticsearch.yml:
+sudo tee /etc/elasticsearch/elasticsearch.yml > /dev/null <<EOF
+cluster.name: security-logs
+node.name: elk-node-1
+path.data: /var/lib/elasticsearch
+path.logs: /var/log/elasticsearch
+network.host: 0.0.0.0
+http.port: 9200
+discovery.type: single-node
+xpack.security.enabled: false
+xpack.security.enrollment.enabled: false
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
+EOF
+2.3 Start Elasticsearch
+# Enable and start service
+sudo systemctl daemon-reload
+sudo systemctl enable elasticsearch
+sudo systemctl start elasticsearch
+
+# Wait for initialization
+sleep 30
+
+# Verify Elasticsearch is running
+curl http://localhost:9200
+
+Expected output (example):
+{
+  "name" : "elk-node-1",
+  "cluster_name" : "security-logs",
+  "version" : {
+    "number" : "8.19.7",
+    "build_flavor" : "default"
+  },
+  "tagline" : "You Know, for Search"
+}
+
+3. Logstash Installation & Configuration
+3.1 Install Logstash
+sudo apt install -y logstash
+
+3.2 (Optional) Install Additional Plugins
+sudo /usr/share/logstash/bin/logstash-plugin install logstash-filter-geoip
+sudo /usr/share/logstash/bin/logstash-plugin install logstash-filter-aggregate
+
+3.3 Set Logstash Permissions
+# Create and set permissions for Logstash data directory
+sudo mkdir -p /usr/share/logstash/data
+sudo chown -R logstash:logstash /usr/share/logstash/data
+
+# Also set permissions for config directory
+sudo chown -R logstash:logstash /var/lib/logstash
+
+# Add logstash user to suricata group to read logs
+sudo usermod -a -G suricata logstash
+
+# Set proper permissions on Suricata log directory
+sudo chmod g+rx /var/log/suricata
+sudo chmod g+r /var/log/suricata/eve.json
+
+# Create sincedb directory
+sudo mkdir -p /var/lib/logstash
+sudo chown logstash:logstash /var/lib/logstash
+
+
+
+3.4 Configure Logstash Pipeline
+Create pipeline configuration at /etc/logstash/conf.d/suricata.conf:
+sudo tee /etc/logstash/conf.d/suricata.conf > /dev/null <<'EOF'
+input {
+  file {
+    path => "/var/log/suricata/eve.json"
+    codec => "json"
+    type => "suricata"
+    start_position => "beginning"
+    sincedb_path => "/var/lib/logstash/sincedb_suricata"
+  }
+}
+
+filter {
+  if [type] == "suricata" {
+
+    # Add timestamp from Suricata log
+    date {
+      match => [ "timestamp", "ISO8601" ]
+      target => "@timestamp"
+    }
+
+    # Parse source and destination IPs
+    if [src_ip] {
+      geoip {
+        source => "src_ip"
+        target => "geoip_src"
+      }
+    }
+
+    if [dest_ip] {
+      geoip {
+        source => "dest_ip"
+        target => "geoip_dest"
+      }
+    }
+
+    # Add severity level based on priority
+    if [alert] {
+      if [alert][severity] == 1 {
+        mutate { add_field => { "severity_level" => "critical" } }
+      } else if [alert][severity] == 2 {
+        mutate { add_field => { "severity_level" => "high" } }
+      } else if [alert][severity] == 3 {
+        mutate { add_field => { "severity_level" => "medium" } }
+      } else {
+        mutate { add_field => { "severity_level" => "low" } }
+      }
+    }
+
+    # Tag web application attacks
+    if [alert][category] =~ /web-application-attack/ {
+      mutate { add_tag => [ "web_attack" ] }
+    }
+
+    # Tag reconnaissance activity
+    if [alert][category] =~ /attempted-recon/ {
+      mutate { add_tag => [ "reconnaissance" ] }
+    }
+
+    # Tag DOS attempts
+    if [alert][category] =~ /attempted-dos/ {
+      mutate { add_tag => [ "dos_attack" ] }
+    }
+
+    # Extract HTTP information if present
+    if [http] {
+      mutate { add_tag => [ "http_traffic" ] }
+
+      # Flag suspicious HTTP methods
+      if [http][http_method] in ["PUT", "DELETE", "TRACE", "CONNECT"] {
+        mutate { add_tag => [ "suspicious_http_method" ] }
+      }
+    }
+
+    # Flag local rules (your custom rules)
+    if [alert][signature] =~ /^LOCAL/ {
+      mutate { add_tag => [ "custom_rule" ] }
+    }
+  }
+}
+
+output {
+  if [type] == "suricata" {
+    elasticsearch {
+      hosts => ["localhost:9200"]
+      index => "suricata-%{+YYYY.MM.dd}"
+      # user => "elastic"
+      # password => "your_password"
+    }
+
+    # stdout { codec => rubydebug }
+  }
+}
+EOF
+
+
+3.5 Start Logstash
+# Test the configuration
+sudo -u logstash /usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/suricata.conf --config.test_and_exit
+
+Example output:
+Configuration OK
+Using config.test_and_exit mode. Config Validation Result: OK. Exiting Logstash...
+
+# Enable and start service
+sudo systemctl enable logstash
+sudo systemctl start logstash
+
+ 
+4. Kibana Installation & Configuration
+4.1 Install Kibana
+sudo apt install -y kibana
+
+4.2 Configure Kibana
+Create configuration at /etc/kibana/kibana.yml:
+sudo tee /etc/kibana/kibana.yml > /dev/null <<EOF
+logging:
+  appenders:
+    file:
+      type: file
+      fileName: /var/log/kibana/kibana.log
+      layout:
+        type: json
+  root:
+    appenders: [default, file]
+    level: info
+
+# Network configuration
+server.host: "0.0.0.0"
+server.port: 5601
+server.name: "elk"
+
+# Elasticsearch configuration
+elasticsearch.hosts: ["http://localhost:9200"]
+EOF
+
+4.3 Set Permissions & Start Kibana
+# Set permissions
+sudo chown -R kibana:kibana /etc/kibana
+sudo chown -R kibana:kibana /var/lib/kibana
+sudo mkdir -p /var/log/kibana
+sudo chown kibana:kibana /var/log/kibana
+
+# Start and enable
+sudo systemctl enable kibana
+sudo systemctl start kibana
+
+4.4 Verify Kibana
+curl -I http://192.168.56.32:5601
+
+Access via browser:
+•	http://192.168.56.32:5601
+ 
+5. Apache & Vulnerable Application Setup
+5.1 Install Apache & PHP
+sudo apt install -y apache2 php libapache2-mod-php php-curl php-xml php-mbstring php-mysql
+sudo a2enmod rewrite
+sudo a2enmod headers
+
+5.2 Configure PHP Logging
+Edit /etc/php/8.1/apache2/php.ini (adjust PHP version as needed):
+log_errors = On
+error_log = /var/log/apache2/php_errors.log
+display_errors = On
+display_startup_errors = On
+
+5.3 Create Application Directory Structure
+# Create directories
+sudo mkdir -p /var/www/html/vulnapp
+sudo mkdir -p /var/log/vulnapp
+
+# Set permissions
+sudo chown -R www-data:www-data /var/www/html/vulnapp
+sudo chmod -R 755 /var/www/html/vulnapp
+sudo chown www-data:www-data /var/log/vulnapp
+sudo chmod 755 /var/log/vulnapp
+
+# Create log files
+sudo touch /var/log/vulnapp/auth_attempts.log
+sudo chown www-data:www-data /var/log/vulnapp/auth_attempts.log
+sudo chmod 644 /var/log/vulnapp/auth_attempts.log
+
+sudo touch /var/log/apache2/php_errors.log
+sudo chown www-data:www-data /var/log/apache2/php_errors.log
+sudo chmod 644 /var/log/apache2/php_errors.log
+
+5.4 Configure Apache Virtual Host
+Create /etc/apache2/sites-available/vulnapp.conf:
+<VirtualHost *:80>
+    ServerName 192.168.56.32
+    DocumentRoot /var/www/html/vulnapp
+
+    <Directory /var/www/html/vulnapp>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+
+        <FilesMatch \.php$>
+            SetHandler application/x-httpd-php
+        </FilesMatch>
+    </Directory>
+
+    DirectoryIndex index.php index.html
+
+    ErrorLog ${APACHE_LOG_DIR}/vulnapp-error.log
+    CustomLog ${APACHE_LOG_DIR}/vulnapp-access.log combined
+
+    LogLevel warn
+</VirtualHost>
+
+5.5 Install Vulnerable Web Application
+sudo tee /var/www/html/vulnapp/index.php > /dev/null <<'EOFPHP'
+<?php
+session_start();
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// Simple database simulation (in real scenario, use MySQL)
+$users_db = [
+    'admin' => 'admin123',
+    'user1' => 'password123',
+    'john' => 'doe123'
+];
+
+$page = isset($_GET['page']) ? $_GET['page'] : 'home';
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    ```
+    <title>Vulnerable Web Application - OWASP Top 10 Testing</title>
+    ```
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; }
+        .header { background: #333; color: white; padding: 20px; margin: -20px -20px 20px -20px; }
+        .nav { background: #555; padding: 10px; margin: -20px -20px 20px -20px; }
+        .nav a { color: white; text-decoration: none; margin-right: 20px; }
+        .vulnerability { border: 1px solid #ddd; padding: 15px; margin: 10px 0; }
+        .vulnerability h3 { color: #d9534f; }
+        input, textarea { width: 300px; padding: 8px; margin: 5px 0; }
+        button { padding: 10px 20px; background: #5cb85c; color: white; border: none; cursor: pointer; }
+        .warning { background: #fcf8e3; border: 1px solid #faebcc; padding: 10px; margin: 10px 0; }
+        .result { background: #d9edf7; border: 1px solid #bce8f1; padding: 10px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>Vulnerable Web Application</h1>
+        <p>Educational Platform for Testing OWASP Top 10 Vulnerabilities</p>
+    </div>
+
+    <div class="nav">
+        <a href="?page=home">Home</a>
+        ```
+        <a href="?page=sql-injection">SQL Injection</a>
+        ```
+        <a href="?page=xss">XSS</a>
+        <a href="?page=idor">IDOR</a>
+        ```
+        <a href="?page=command-injection">Command Injection</a>
+        ```
+        ```
+        <a href="?page=file-inclusion">File Inclusion</a>
+        ```
+        <a href="?page=xxe">XXE</a>
+        <a href="?page=ssrf">SSRF</a>
+    </div>
+
+    <div class="warning">
+        <strong>WARNING:</strong> This application is intentionally vulnerable!
+        Use only in isolated test environments. Never expose to the internet!
+    </div>
+
+    <?php
+    switch($page) {
+        case 'home':
+            ?>
+            ```
+            <h2>Welcome to Vulnerable Web App</h2>
+            ```
+            <p>This application contains intentional security vulnerabilities for educational purposes.</p>
+            <h3>Available Vulnerabilities:</h3>
+            <ul>
+                ```
+                <li><strong>SQL Injection (A03:2021)</strong> - Database query manipulation</li>
+                ```
+                ```
+                <li><strong>Cross-Site Scripting - XSS (A03:2021)</strong> - Script injection in web pages</li>
+                ```
+                ```
+                <li><strong>Insecure Direct Object Reference - IDOR (A01:2021)</strong> - Unauthorized resource access</li>
+                ```
+                ```
+                <li><strong>Command Injection (A03:2021)</strong> - OS command execution</li>
+                ```
+                ```
+                <li><strong>Local File Inclusion - LFI (A05:2021)</strong> - Arbitrary file reading</li>
+                ```
+                ```
+                <li><strong>XML External Entity - XXE (A05:2021)</strong> - XML parser exploitation</li>
+                ```
+                ```
+                <li><strong>Server-Side Request Forgery - SSRF (A10:2021)</strong> - Internal network access</li>
+                ```
+            </ul>
+            <?php
+            break;
+
+        case 'sql-injection':
+            ?>
+            <div class="vulnerability">
+                ```
+                <h3>A03:2021 - SQL Injection Vulnerability</h3>
+                ```
+                ```
+                <p>Try to bypass authentication or extract data using SQL injection.</p>
+                ```
+
+                <form method="POST">
+                    <h4>Login Form (Vulnerable)</h4>
+                    <input type="text" name="username" placeholder="Username" required><br>
+                    <input type="password" name="password" placeholder="Password" required><br>
+                    <button type="submit" name="login">Login</button>
+                </form>
+
+                <?php
+                if(isset($_POST['login'])) {
+                    $log_entry = date('Y-m-d H:i:s') . " - " .
+                                 $_SERVER['REMOTE_ADDR'] . " - " .
+                                 "Username: " . $_POST['username'] . " - " .
+                                 "Password: " . $_POST['password'] . "\n";
+                    file_put_contents('/var/log/vulnapp/auth_attempts.log', $log_entry, FILE_APPEND);
+
+                    $username = $_POST['username'];
+                    $password = $_POST['password'];
+
+                    $query = "SELECT * FROM users WHERE username='$username' AND password='$password'";
+
+                    echo "<div class='result'>";
+                    ```
+                    echo "<strong>Query executed:</strong><br><code>$query</code><br><br>";
+                    ```
+
+                    if(strpos($username, "'") !== false || strpos($username, "OR") !== false) {
+                        ```
+                        echo "<span style='color: red;'>SQL Injection successful! You are logged in as admin!</span><br>";
+                        ```
+                        ```
+                        echo "<strong>Try:</strong> admin' OR '1'='1<br>";
+                        ```
+                        ```
+                        echo "<strong>Try:</strong> ' OR 1=1--<br>";
+                        ```
+                        ```
+                        echo "<strong>Try:</strong> admin'--";
+                        ```
+                    } elseif(isset($users_db[$username]) && $users_db[$username] === $password) {
+                        ```
+                        echo "<span style='color: green;'>Login successful!</span>";
+                        ```
+                    } else {
+                        ```
+                        echo "<span style='color: red;'>Invalid credentials</span>";
+                        ```
+                    }
+                    echo "</div>";
+                }
+                ?>
+
+                <h4>Search Users (Vulnerable)</h4>
+                <form method="GET">
+                    <input type="hidden" name="page" value="sql-injection">
+                    <input type="text" name="search" placeholder="Search username">
+                    <button type="submit">Search</button>
+                </form>
+
+                <?php
+                if(isset($_GET['search'])) {
+                    $search = $_GET['search'];
+                    $query = "SELECT * FROM users WHERE username LIKE '%$search%'";
+                    echo "<div class='result'>";
+                    ```
+                    echo "<strong>Query:</strong> <code>$query</code><br>";
+                    ```
+                    ```
+                    echo "<strong>Try UNION injection:</strong> ' UNION SELECT null,username,password FROM users--";
+                    ```
+                    echo "</div>";
+                }
+                ?>
+            </div>
+            <?php
+            break;
+
+        case 'xss':
+            ?>
+            <div class="vulnerability">
+                ```
+                <h3>A03:2021 - Cross-Site Scripting (XSS)</h3>
+                ```
+
+                <h4>Reflected XSS</h4>
+                <form method="GET">
+                    <input type="hidden" name="page" value="xss">
+                    <input type="text" name="name" placeholder="Enter your name">
+                    <button type="submit">Submit</button>
+                </form>
+
+                <?php
+                if(isset($_GET['name'])) {
+                    ```
+                    echo "<div class='result'>Hello, " . $_GET['name'] . "!</div>";
+                    ```
+                    ```
+                    echo "<p><strong>Try:</strong> <script>alert('XSS')</script></p>";
+                    ```
+                    ```
+                    echo "<p><strong>Try:</strong> <img src=x onerror=alert('XSS')></p>";
+                    ```
+                }
+                ?>
+
+                <h4>Stored XSS (Comment Section)</h4>
+                <form method="POST">
+                    <textarea name="comment" placeholder="Leave a comment"></textarea><br>
+                    <button type="submit" name="post_comment">Post Comment</button>
+                </form>
+
+                <?php
+                if(!isset($_SESSION['comments'])) {
+                    $_SESSION['comments'] = [];
+                }
+
+                if(isset($_POST['post_comment'])) {
+                    $_SESSION['comments'][] = $_POST['comment'];
+                }
+
+                ```
+                echo "<h4>Comments:</h4>";
+                ```
+                foreach($_SESSION['comments'] as $comment) {
+                    ```
+                    echo "<div class='result'>$comment</div>";
+                    ```
+                }
+                ?>
+            </div>
+            <?php
+            break;
+
+        case 'idor':
+            ?>
+            <div class="vulnerability">
+                ```
+                <h3>A01:2021 - Insecure Direct Object Reference (IDOR)</h3>
+                ```
+                <p>Access other users' profiles by changing the user ID.</p>
+
+                <?php
+                $profiles = [
+                    1 => ['name' => 'John Doe',  'email' => 'john@example.com',  'ssn' => '123-45-6789'],
+                    2 => ['name' => 'Jane Smith','email' => 'jane@example.com',  'ssn' => '987-65-4321'],
+                    3 => ['name' => 'Admin User','email' => 'admin@example.com', 'ssn' => '555-55-5555'],
+                ];
+
+                $user_id = isset($_GET['user_id']) ? $_GET['user_id'] : 1;
+
+                echo "<p>Currently viewing profile:
+                        <a href='?page=idor&user_id=1'>User 1</a> |
+                        <a href='?page=idor&user_id=2'>User 2</a> |
+                        ```
+                        <a href='?page=idor&user_id=3'>User 3</a></p>";
+                        ```
+
+                if(isset($profiles[$user_id])) {
+                    $profile = $profiles[$user_id];
+                    echo "<div class='result'>";
+                    ```
+                    echo "<h4>Profile Information</h4>";
+                    ```
+                    ```
+                    echo "<strong>Name:</strong> {$profile['name']}<br>";
+                    ```
+                    ```
+                    echo "<strong>Email:</strong> {$profile['email']}<br>";
+                    ```
+                    ```
+                    echo "<strong>SSN:</strong> {$profile['ssn']}<br>";
+                    ```
+                    echo "</div>";
+                    ```
+                    echo "<p><strong>Try:</strong> Change user_id in URL to access other profiles</p>";
+                    ```
+                }
+                ?>
+            </div>
+            <?php
+            break;
+
+        case 'command-injection':
+            ?>
+            <div class="vulnerability">
+                ```
+                <h3>A03:2021 - OS Command Injection</h3>
+                ```
+                <p>Execute system commands by injecting into the ping command.</p>
+
+                <form method="POST">
+                    <input type="text" name="host" placeholder="Enter IP or hostname" value="127.0.0.1">
+                    <button type="submit" name="ping">Ping Host</button>
+                </form>
+
+                <?php
+                if(isset($_POST['ping'])) {
+                    $host = $_POST['host'];
+                    $command = "ping -c 4 " . $host;
+
+                    echo "<div class='result'>";
+                    ```
+                    echo "<strong>Executing:</strong> <code>$command</code><br><br>";
+                    ```
+                    echo "<pre>";
+                    echo "Command injection detected in input: $host\n\n";
+                    ```
+                    echo "<strong>Try these payloads:</strong>\n";
+                    ```
+                    echo "127.0.0.1; ls -la\n";
+                    echo "127.0.0.1 && cat /etc/passwd\n";
+                    echo "127.0.0.1 | whoami\n";
+                    echo "127.0.0.1; id\n";
+                    echo "</pre>";
+                    echo "</div>";
+                }
+                ?>
+            </div>
+            <?php
+            break;
+
+        case 'file-inclusion':
+            ?>
+            <div class="vulnerability">
+                ```
+                <h3>A05:2021 - Local File Inclusion (LFI)</h3>
+                ```
+                <p>Read arbitrary files from the server.</p>
+
+                <form method="GET">
+                    <input type="hidden" name="page" value="file-inclusion">
+                    <input type="text" name="file" placeholder="Enter filename" value="welcome.txt">
+                    <button type="submit">Load File</button>
+                </form>
+
+                <?php
+                if(isset($_GET['file'])) {
+                    $file = $_GET['file'];
+
+                    echo "<div class='result'>";
+                    ```
+                    echo "<strong>Attempting to load:</strong> <code>$file</code><br><br>";
+                    ```
+
+                    ```
+                    echo "<strong>Try these payloads:</strong><br>";
+                    ```
+                    echo "../../../../../etc/passwd<br>";
+                    echo "../../../../../etc/hosts<br>";
+                    echo "../../../../../var/log/apache2/access.log<br>";
+                    echo "php://filter/convert.base64-encode/resource=index.php<br>";
+
+                    ```
+                    echo "<br><strong>File inclusion vulnerability detected!</strong>";
+                    ```
+                    echo "</div>";
+                }
+                ?>
+            </div>
+            <?php
+            break;
+
+        case 'xxe':
+            ?>
+            <div class="vulnerability">
+                ```
+                <h3>A05:2021 - XML External Entity (XXE)</h3>
+                ```
+                ```
+                <p>Submit XML data to exploit XXE vulnerability.</p>
+                ```
+
+                <form method="POST">
+                    <textarea name="xml" rows="10" cols="60" placeholder="Enter XML">
+<?xml version="1.0"?>
+<user>
+    <name>John</name>
+    <email>john@example.com</email>
+</user>
+                    </textarea><br>
+                    <button type="submit" name="parse_xml">Parse XML</button>
+                </form>
+
+                <?php
+                if(isset($_POST['parse_xml'])) {
+                    $xml_data = $_POST['xml'];
+
+                    echo "<div class='result'>";
+                    ```
+                    echo "<strong>XML Received:</strong><br>";
+                    ```
+                    ```
+                    echo "<pre>" . htmlspecialchars($xml_data) . "</pre>";
+                    ```
+
+                    ```
+                    echo "<br><strong>XXE Exploitation Payloads:</strong><br>";
+                    ```
+                    echo "<pre>";
+                    echo htmlspecialchars('<?xml version="1.0"?>
+<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<user>
+    ```
+    <name>&xxe;</name>
+    ```
+</user>');
+                    echo "</pre>";
+
+                    echo "</div>";
+                }
+                ?>
+            </div>
+            <?php
+            break;
+
+        case 'ssrf':
+            ?>
+            <div class="vulnerability">
+                ```
+                <h3>A10:2021 - Server-Side Request Forgery (SSRF)</h3>
+                ```
+                <p>Make the server fetch URLs on your behalf.</p>
+
+                <form method="POST">
+                    <input type="text" name="url" placeholder="Enter URL to fetch" value="http://example.com">
+                    <button type="submit" name="fetch">Fetch URL</button>
+                </form>
+
+                <?php
+                if(isset($_POST['fetch'])) {
+                    $url = $_POST['url'];
+
+                    echo "<div class='result'>";
+                    ```
+                    echo "<strong>Fetching:</strong> <code>$url</code><br><br>";
+                    ```
+
+                    ```
+                    echo "<strong>SSRF Exploitation Payloads:</strong><br>";
+                    ```
+                    echo "http://localhost:9200 (Elasticsearch)<br>";
+                    echo "http://127.0.0.1:5601 (Kibana)<br>";
+                    echo "http://169.254.169.254/latest/meta-data/<br>";
+                    echo "file:///etc/passwd<br>";
+                    echo "http://localhost:22<br>";
+
+                    ```
+                    echo "<br><strong>SSRF vulnerability detected!</strong>";
+                    ```
+                    echo "</div>";
+                }
+                ?>
+            </div>
+            <?php
+            break;
+
+        default:
+            ```
+            echo "<h2>Page not found</h2>";
+            ```
+    }
+    ?>
+</div>
+</body>
+</html>
+EOFPHP
+
+5.6 Enable Site & Restart Apache
+# Disable default site and enable vulnapp
+sudo a2dissite 000-default.conf
+sudo a2ensite vulnapp.conf
+
+# Fix ServerName warning
+echo "ServerName 192.168.56.32" | sudo tee /etc/apache2/conf-available/servername.conf
+sudo a2enconf servername
+
+# Test configuration and restart
+sudo apache2ctl configtest
+sudo systemctl restart apache2
+sudo systemctl enable apache2
+
+ 
+6. Suricata Installation & Configuration
+6.1 Install Suricata
+sudo add-apt-repository ppa:oisf/suricata-stable -y
+sudo apt update
+sudo apt install suricata -y
+
+6.2 Understanding Suricata Rules Structure
+Suricata uses two main rules directories:
+•	Primary rules path: /var/lib/suricata/rules/ (managed by suricata-update)
+•	Secondary rules path: /etc/suricata/rules/ (for additional custom rules)
+Key configuration in /etc/suricata/suricata.yaml:
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - local.rules
+  - suricata.rules
+
+6.3 Create Custom Local Rules
+Create your custom rules in /var/lib/suricata/rules/local.rules:
+sudo tee /var/lib/suricata/rules/local.rules > /dev/null << 'EOF'
+# Suricata Local Rules - Web Server Attacks & Scanning Detection
+# Save to: /var/lib/suricata/rules/local.rules
+
+# ============================================
+# NMAP SCAN DETECTION
+# ============================================
+
+# Detect Nmap TCP SYN scan
+alert tcp any any -> $HOME_NET any (msg:"LOCAL - Nmap TCP SYN Scan Detected"; flags:S,12; threshold: type both, track by_src, count 20, seconds 60; classtype:attempted-recon; sid:1000001; rev:1;)
+
+# Detect Nmap TCP Connect scan
+alert tcp any any -> $HOME_NET any (msg:"LOCAL - Nmap TCP Connect Scan Detected"; flow:to_server; flags:S; threshold: type both, track by_src, count 25, seconds 60; classtype:attempted-recon; sid:1000002; rev:1;)
+
+# Detect Nmap NULL scan
+alert tcp any any -> $HOME_NET any (msg:"LOCAL - Nmap NULL Scan Detected"; flags:0; threshold: type both, track by_src, count 10, seconds 60; classtype:attempted-recon; sid:1000003; rev:1;)
+
+# Detect Nmap FIN scan
+alert tcp any any -> $HOME_NET any (msg:"LOCAL - Nmap FIN Scan Detected"; flags:F; threshold: type both, track by_src, count 10, seconds 60; classtype:attempted-recon; sid:1000004; rev:1;)
+
+# Detect Nmap XMAS scan
+alert tcp any any -> $HOME_NET any (msg:"LOCAL - Nmap XMAS Scan Detected"; flags:FPU; threshold: type both, track by_src, count 10, seconds 60; classtype:attempted-recon; sid:1000005; rev:1;)
+
+# Detect Nmap version detection
+alert tcp any any -> $HOME_NET any (msg:"LOCAL - Nmap Service Version Detection"; content:"Nmap"; nocase; classtype:attempted-recon; sid:1000006; rev:1;)
+
+# ============================================
+# PING SCAN DETECTION
+# ============================================
+
+# Detect ICMP ping sweep
+alert icmp any any -> $HOME_NET any (msg:"LOCAL - ICMP Ping Sweep Detected"; itype:8; threshold: type both, track by_src, count 10, seconds 5; classtype:attempted-recon; sid:1000010; rev:1;)
+
+# Detect large ICMP packets (possible ping of death)
+alert icmp any any -> $HOME_NET any (msg:"LOCAL - Large ICMP Packet (Ping of Death)"; dsize:>1024; itype:8; classtype:attempted-dos; sid:1000011; rev:1;)
+
+# ============================================
+# WEB SERVER ATTACKS - SQL INJECTION
+# ============================================
+
+# SQL Injection - UNION SELECT
+alert http any any -> $HOME_NET any (msg:"LOCAL - SQL Injection UNION SELECT Attempt"; flow:established,to_server; content:"union"; nocase; http_uri; content:"select"; nocase; distance:0; http_uri; classtype:web-application-attack; sid:1000020; rev:1;)
+
+# SQL Injection - OR 1=1
+alert http any any -> $HOME_NET any (msg:"LOCAL - SQL Injection OR 1=1 Pattern"; flow:established,to_server; content:"or"; nocase; http_uri; content:"1=1"; nocase; distance:0; http_uri; classtype:web-application-attack; sid:1000022; rev:1;)
+
+# SQL Injection in POST body
+alert http any any -> $HOME_NET any (msg:"LOCAL - SQL Injection in POST Data"; flow:established,to_server; content:"union"; nocase; http_client_body; content:"select"; nocase; distance:0; http_client_body; classtype:web-application-attack; sid:1000024; rev:1;)
+
+# ============================================
+# WEB SERVER ATTACKS - XSS
+# ============================================
+
+# XSS - Script tags
+alert http any any -> $HOME_NET any (msg:"LOCAL - XSS Script Tag Attempt"; flow:established,to_server; content:"<script"; nocase; http_uri; classtype:web-application-attack; sid:1000030; rev:1;)
+
+# XSS - JavaScript protocol
+alert http any any -> $HOME_NET any (msg:"LOCAL - XSS JavaScript Protocol Attempt"; flow:established,to_server; content:"javascript:"; nocase; http_uri; classtype:web-application-attack; sid:1000032; rev:1;)
+
+# ============================================
+# WEB SERVER ATTACKS - PATH TRAVERSAL
+# ============================================
+
+# Directory traversal - ../ pattern
+alert http any any -> $HOME_NET any (msg:"LOCAL - Directory Traversal Attempt"; flow:established,to_server; content:"../"; http_uri; threshold: type both, track by_src, count 3, seconds 60; classtype:web-application-attack; sid:1000040; rev:1;)
+
+# /etc/passwd access attempt
+alert http any any -> $HOME_NET any (msg:"LOCAL - /etc/passwd Access Attempt"; flow:established,to_server; content:"/etc/passwd"; nocase; http_uri; classtype:web-application-attack; sid:1000042; rev:1;)
+
+# ============================================
+# WEB SERVER ATTACKS - COMMAND INJECTION
+# ============================================
+
+# Command injection - cat
+alert http any any -> $HOME_NET any (msg:"LOCAL - Command Injection cat"; flow:established,to_server; content:";cat"; http_uri; nocase; classtype:web-application-attack; sid:1000050; rev:1;)
+
+# Command injection - wget/curl
+alert http any any -> $HOME_NET any (msg:"LOCAL - Command Injection wget/curl"; flow:established,to_server; content:"wget"; http_uri; nocase; classtype:web-application-attack; sid:1000052; rev:1;)
+
+# ============================================
+# WEB SERVER ATTACKS - FILE UPLOAD
+# ============================================
+
+# PHP file upload
+alert http any any -> $HOME_NET any (msg:"LOCAL - Suspicious PHP File Upload"; flow:established,to_server; content:"Content-Type|3a| multipart/form-data"; http_header; content:".php"; nocase; http_client_body; classtype:web-application-attack; sid:1000060; rev:1;)
+
+# ============================================
+# WEB SERVER ATTACKS - SCANNER/BOT DETECTION
+# ============================================
+
+# Nikto scanner
+alert http any any -> $HOME_NET any (msg:"LOCAL - Nikto Web Scanner Detected"; flow:established,to_server; content:"Nikto"; http_user_agent; classtype:web-application-attack; sid:1000070; rev:1;)
+
+# SQLMap scanner
+alert http any any -> $HOME_NET any (msg:"LOCAL - SQLMap Scanner Detected"; flow:established,to_server; content:"sqlmap"; nocase; http_user_agent; classtype:web-application-attack; sid:1000071; rev:1;)
+
+# ============================================
+# WEB APPLICATION BRUTE FORCE (ENHANCED)
+# ============================================
+
+# Login endpoints
+alert http any any -> $HOME_NET any (msg:"LOCAL - HTTP Login Brute Force - login"; flow:established,to_server; content:"POST"; http_method; content:"login"; http_uri; nocase; threshold: type both, track by_src, count 10, seconds 60; classtype:web-application-attack; sid:1000230; rev:1;)
+
+EOF
+
+Set proper permissions:
+sudo chown root:suricata /var/lib/suricata/rules/local.rules
+sudo chmod 644 /var/lib/suricata/rules/local.rules
+
+6.4 Configure Suricata Main Configuration
+Edit /etc/suricata/suricata.yaml (key sections):
+vars:
+  address-groups:
+    HOME_NET: "[192.168.56.0/24]"
+    EXTERNAL_NET: "any"
+    HTTP_SERVERS: "[192.168.56.32]"
+  port-groups:
+    HTTP_PORTS: "80"
+
+default-log-dir: /var/log/suricata/
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert:
+            payload: yes
+        - http:
+            extended: yes
+        - dns:
+            enabled: yes
+        - tls:
+            extended: yes
+        - stats:
+            totals: yes
+        - flow
+
+af-packet:
+  - interface: enp0s3
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - suricata.rules
+  - local.rules
+
+6.5 Update Rules & Start Suricata
+# Update rules from sources
+sudo suricata-update
+
+# Test configuration
+sudo suricata -T -c /etc/suricata/suricata.yaml
+
+# Enable and start service
+sudo systemctl enable suricata
+sudo systemctl start suricata
+
+6.6 Verify Suricata is Detecting Traffic
+# Monitor eve.json for alerts in real-time
+sudo tail -f /var/log/suricata/eve.json | grep "alert"
+
+# View fast.log for quick alert summary
+sudo tail -f /var/log/suricata/fast.log
+
+# Check stats
+sudo tail -f /var/log/suricata/stats.log
+
+
+
+7. System Architecture & File Structure
+7.1 Directory Structure
+/var/lib/suricata/
+└── rules/
+    ├── local.rules          # Custom rules (root:suricata, 644)
+    ├── suricata.rules       # Main ruleset
+    └── emerging-*.rules     # Categorized rules
+
+/etc/suricata/
+├── suricata.yaml           # Main configuration
+├── classification.config   # Alert classifications
+├── reference.config        # Reference systems
+└── rules/
+    └── local.rules         # Additional custom rules
+
+/var/log/suricata/
+├── eve.json               # JSON event log (sent to Logstash)
+├── fast.log               # Fast alert log
+├── stats.log              # Statistics
+└── suricata.log           # Main Suricata log
+
+/var/www/html/vulnapp/
+└── index.php              # Vulnerable application
+
+/var/log/vulnapp/
+└── auth_attempts.log      # Application authentication log
+
+/var/log/apache2/
+├── vulnapp-access.log     # Apache access log
+├── vulnapp-error.log      # Apache error log
+└── php_errors.log         # PHP error log
+
+7.2 Component Overview
+Component	Configuration	Location	Port
+Elasticsearch	Cluster: security-logs	/etc/elasticsearch/elasticsearch.yml	9200
+Logstash	Suricata pipeline	/etc/logstash/conf.d/suricata.conf	5044
+Kibana	ELK UI	/etc/kibana/kibana.yml	5601
+Apache	VulnApp VHost	/etc/apache2/sites-available/vulnapp.conf	80
+Suricata	IDS/IPS	/etc/suricata/suricata.yaml	-
+
+7.3 Network Configuration
+HOME_NET:        192.168.56.0/24
+HTTP_SERVERS:    192.168.56.32
+EXTERNAL_NET:    any
+Interface:       enp0s3
+Monitored Ports: 80, 22, 53, 443, 445, 21, 25, 110, 143
+
+ 
+8. Verification & Testing
+8.1 Service Status Check
+sudo systemctl status elasticsearch
+sudo systemctl status logstash
+sudo systemctl status kibana
+sudo systemctl status apache2
+sudo systemctl status suricata
+
+8.2 Log Monitoring
+# Monitor Suricata alerts
+sudo tail -f /var/log/suricata/eve.json | jq 'select(.event_type=="alert")'
+
+# Monitor Apache access
+sudo tail -f /var/log/apache2/vulnapp-access.log
+
+# Monitor authentication attempts
+sudo tail -f /var/log/vulnapp/auth_attempts.log
+
+# Check Elasticsearch indices
+curl http://localhost:9200/_cat/indices?v
+
+8.3 Test Detection Rules
+From the Kali machine:
+# Test HTTP detection
+curl http://192.168.56.32
+
+# Test SSH detection
+ssh elk@192.168.56.32
+
+# Test SQL injection (through vulnerable app)
+curl "http://192.168.56.32/index.php?page=sql-injection&username=admin' OR '1'='1&password=x"
+
+# Test XSS (through vulnerable app)
+curl "http://192.168.56.32/index.php?page=xss&name=<script>alert('XSS')</script>"
+
+8.4 Verify Rules are Working
+# Count alerts by signature
+sudo jq -r 'select(.event_type=="alert") | .alert.signature' /var/log/suricata/eve.json | sort | uniq -c
+
+# View recent alerts
+sudo jq 'select(.event_type=="alert")' /var/log/suricata/eve.json | tail -20
+
+ 
+9. Kibana Visualization
+9.1 Refresh Index Pattern in Kibana
+1.	Open Kibana: http://192.168.56.32:5601
+2.	Click the hamburger menu (☰) top left.
+3.	Go to Management → Stack Management.
+4.	Click Index Patterns (under Kibana).
+5.	Click on suricata-*.
+6.	Click the refresh (🔄) button to reload field mappings.
+7.	Click Save.
+9.2 View Alerts in Discover
+1.	Go to Discover.
+2.	Select suricata-* in the index pattern dropdown.
+3.	Set time range to Last 24 hours.
+4.	Use queries such as:
+o	event_type:alert
+o	alert.signature:"LOCAL - Nmap TCP SYN Scan Detected"
+o	tags:web_attack
+
+
+
